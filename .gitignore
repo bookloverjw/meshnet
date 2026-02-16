@@ -1,6 +1,7 @@
 bin/
-mesh
-meshd
+/mesh
+/meshd
+/meshgui
 *.exe
 *.conf
 config.json
