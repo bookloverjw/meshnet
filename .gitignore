@@ -2,6 +2,7 @@ bin/
 /mesh
 /meshd
 /meshgui
+meshd-linux-amd64
 *.exe
 *.conf
 config.json
