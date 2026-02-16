@@ -1,269 +1,273 @@
-// meshgui is a simple graphical wrapper for the mesh client.
-// Double-click to launch — it opens a browser tab with a clean
-// connect/disconnect UI. No terminal needed.
+// meshgui is a native GUI app for the mesh client.
+// Double-click to launch — no terminal needed.
 package main
 
 import (
 	"context"
-	"embed"
-	"encoding/json"
 	"fmt"
-	"log"
-	"net"
-	"net/http"
-	"os"
-	"os/exec"
-	"os/signal"
-	"runtime"
 	"sync"
-	"syscall"
+	"time"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/canvas"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
 
 	"github.com/bookloverjw/meshnet/internal/client"
 	"github.com/bookloverjw/meshnet/internal/config"
 	"github.com/bookloverjw/meshnet/internal/protocol"
 )
 
-//go:embed static
-var staticFiles embed.FS
+type meshApp struct {
+	mu        sync.RWMutex
+	connected bool
+	meshClient *client.Client
+	cancel    context.CancelFunc
+	cfg       *config.Config
 
-// appState holds the current connection state for the API.
-type appState struct {
-	mu         sync.RWMutex
-	connected  bool
-	status     string
-	peerCount  int
-	peers      []peerEntry
-	deviceName string
-	publicKey  string
-	tunnelIP   string
+	// UI elements
+	statusDot   *canvas.Circle
+	statusLabel *widget.Label
+	peerLabel   *widget.Label
+	peerList    *widget.List
+	btn         *widget.Button
 
-	client *client.Client
-	cancel context.CancelFunc
-	cfg    *config.Config
+	peers []peerDisplay
 }
 
-type peerEntry struct {
-	Name      string `json:"name"`
-	PublicKey string `json:"public_key"`
-	Online    bool   `json:"online"`
-}
-
-type statusResponse struct {
-	Connected  bool        `json:"connected"`
-	Status     string      `json:"status"`
-	PeerCount  int         `json:"peer_count"`
-	Peers      []peerEntry `json:"peers"`
-	DeviceName string      `json:"device_name"`
-	PublicKey  string      `json:"public_key"`
-	TunnelIP   string      `json:"tunnel_ip"`
-}
-
-var state = &appState{
-	status: "Disconnected",
+type peerDisplay struct {
+	Name   string
+	Online bool
 }
 
 func main() {
+	fyneApp := app.New()
+	win := fyneApp.NewWindow("Meshnet")
+	win.Resize(fyne.NewSize(340, 420))
+	win.SetFixedSize(true)
+
+	ma := &meshApp{}
+
 	// Load config
 	cfg, err := config.Load()
 	if err != nil {
-		// Try to give a helpful message on first run
-		fmt.Println("Config not found. Run 'mesh init' first to set up this device.")
-		fmt.Println("Or place config.json in the meshnet config directory.")
-		fmt.Printf("Error: %v\n", err)
-		waitForEnter()
-		os.Exit(1)
+		errLabel := widget.NewLabel("Config not found.\nRun 'mesh init' first to set up this device.")
+		errLabel.Wrapping = fyne.TextWrapWord
+		win.SetContent(container.NewVBox(
+			widget.NewLabel("Meshnet"),
+			errLabel,
+		))
+		win.ShowAndRun()
+		return
 	}
+	ma.cfg = cfg
 
-	state.cfg = cfg
-	state.deviceName = cfg.DeviceName
-	state.publicKey = cfg.PublicKey
-	state.tunnelIP = cfg.TunnelIPv4
+	// Build UI
+	win.SetContent(ma.buildUI())
 
-	// Find a free port
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		log.Fatalf("failed to find free port: %v", err)
-	}
-	port := listener.Addr().(*net.TCPAddr).Port
-	listener.Close()
+	// Cleanup on close
+	win.SetOnClosed(func() {
+		ma.disconnect()
+	})
 
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	url := fmt.Sprintf("http://%s", addr)
-
-	// Set up HTTP routes
-	mux := http.NewServeMux()
-	mux.Handle("/", http.FileServer(http.FS(staticFiles)))
-	mux.HandleFunc("/api/status", handleStatus)
-	mux.HandleFunc("/api/connect", handleConnect)
-	mux.HandleFunc("/api/disconnect", handleDisconnect)
-
-	// Start server
-	go func() {
-		log.Printf("meshgui listening on %s", url)
-		if err := http.ListenAndServe(addr, mux); err != nil {
-			log.Fatal(err)
-		}
-	}()
-
-	// Open browser
-	openBrowser(url + "/static/")
-
-	fmt.Println("Meshnet is running. Close this window to quit.")
-
-	// Wait for signal
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	<-sigCh
-
-	// Cleanup
-	state.mu.Lock()
-	if state.cancel != nil {
-		state.cancel()
-	}
-	if state.client != nil {
-		state.client.Disconnect()
-	}
-	state.mu.Unlock()
+	win.ShowAndRun()
 }
 
-func handleStatus(w http.ResponseWriter, r *http.Request) {
-	state.mu.RLock()
-	resp := statusResponse{
-		Connected:  state.connected,
-		Status:     state.status,
-		PeerCount:  state.peerCount,
-		Peers:      state.peers,
-		DeviceName: state.deviceName,
-		PublicKey:  state.publicKey,
-		TunnelIP:   state.tunnelIP,
-	}
-	state.mu.RUnlock()
+func (ma *meshApp) buildUI() fyne.CanvasObject {
+	// Title
+	title := canvas.NewText("Meshnet", theme.Color(theme.ColorNameForeground))
+	title.TextSize = 22
+	title.TextStyle = fyne.TextStyle{Bold: true}
+	title.Alignment = fyne.TextAlignCenter
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
-}
+	// Status indicator
+	ma.statusDot = canvas.NewCircle(theme.Color(theme.ColorNameError))
+	ma.statusDot.Resize(fyne.NewSize(12, 12))
 
-func handleConnect(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+	ma.statusLabel = widget.NewLabel("Disconnected")
 
-	state.mu.Lock()
-	if state.connected {
-		state.mu.Unlock()
-		json.NewEncoder(w).Encode(map[string]string{"status": "already connected"})
-		return
-	}
-	state.status = "Connecting..."
-	state.mu.Unlock()
+	statusRow := container.NewHBox(
+		container.NewStack(
+			container.NewWithoutLayout(ma.statusDot),
+		),
+		ma.statusLabel,
+	)
 
-	go doConnect()
+	// Device info
+	deviceInfo := widget.NewLabel(fmt.Sprintf("Device: %s\nTunnel IP: %s",
+		ma.cfg.DeviceName, ma.cfg.TunnelIPv4))
+	deviceInfo.TextStyle = fyne.TextStyle{}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "connecting"})
-}
+	// Peer count
+	ma.peerLabel = widget.NewLabel("Peers online: —")
 
-func handleDisconnect(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	state.mu.Lock()
-	if !state.connected {
-		state.mu.Unlock()
-		json.NewEncoder(w).Encode(map[string]string{"status": "not connected"})
-		return
-	}
-
-	if state.cancel != nil {
-		state.cancel()
-	}
-	if state.client != nil {
-		state.client.Disconnect()
-	}
-	state.connected = false
-	state.status = "Disconnected"
-	state.peerCount = 0
-	state.peers = nil
-	state.client = nil
-	state.cancel = nil
-	state.mu.Unlock()
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "disconnected"})
-}
-
-func doConnect() {
-	c, err := client.New(state.cfg)
-	if err != nil {
-		state.mu.Lock()
-		state.status = fmt.Sprintf("Error: %v", err)
-		state.mu.Unlock()
-		return
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	c.OnPeerUpdate = func(peers []protocol.PeerInfo) {
-		state.mu.Lock()
-		state.peerCount = 0
-		state.peers = nil
-		for _, p := range peers {
-			if p.PublicKey == state.publicKey {
-				continue
+	// Peer list
+	ma.peerList = widget.NewList(
+		func() int {
+			ma.mu.RLock()
+			defer ma.mu.RUnlock()
+			return len(ma.peers)
+		},
+		func() fyne.CanvasObject {
+			return container.NewHBox(
+				canvas.NewCircle(theme.Color(theme.ColorNameForeground)),
+				widget.NewLabel("peer-name"),
+			)
+		},
+		func(id widget.ListItemID, obj fyne.CanvasObject) {
+			ma.mu.RLock()
+			defer ma.mu.RUnlock()
+			if id >= len(ma.peers) {
+				return
 			}
+			p := ma.peers[id]
+			items := obj.(*fyne.Container).Objects
+			dot := items[0].(*canvas.Circle)
+			label := items[1].(*widget.Label)
+			label.SetText(p.Name)
 			if p.Online {
-				state.peerCount++
+				dot.FillColor = theme.Color(theme.ColorNameSuccess)
+			} else {
+				dot.FillColor = theme.Color(theme.ColorNameDisabled)
 			}
-			state.peers = append(state.peers, peerEntry{
-				Name:      p.Name,
-				PublicKey: p.PublicKey,
-				Online:    p.Online,
-			})
+			dot.Refresh()
+		},
+	)
+	ma.peerList.HideSeparators = true
+
+	// Connect button
+	ma.btn = widget.NewButton("Connect", func() {
+		ma.mu.RLock()
+		isConnected := ma.connected
+		ma.mu.RUnlock()
+
+		if isConnected {
+			ma.disconnect()
+		} else {
+			ma.connect()
 		}
-		state.mu.Unlock()
-	}
+	})
+	ma.btn.Importance = widget.HighImportance
 
-	c.OnConnected = func(peerName string, tunnelIP string) {
-		state.mu.Lock()
-		state.status = fmt.Sprintf("Tunneled to %s (%s)", peerName, tunnelIP)
-		state.mu.Unlock()
-	}
-
-	if err := c.Connect(ctx); err != nil {
-		cancel()
-		state.mu.Lock()
-		state.status = fmt.Sprintf("Connection failed: %v", err)
-		state.connected = false
-		state.mu.Unlock()
-		return
-	}
-
-	state.mu.Lock()
-	state.connected = true
-	state.status = "Connected"
-	state.client = c
-	state.cancel = cancel
-	state.mu.Unlock()
+	return container.NewVBox(
+		title,
+		widget.NewSeparator(),
+		layout.NewSpacer(),
+		statusRow,
+		deviceInfo,
+		ma.peerLabel,
+		container.NewStack(ma.peerList),
+		layout.NewSpacer(),
+		ma.btn,
+	)
 }
 
-func openBrowser(url string) {
-	var cmd *exec.Cmd
-	switch runtime.GOOS {
-	case "darwin":
-		cmd = exec.Command("open", url)
-	case "windows":
-		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
-	default:
-		cmd = exec.Command("xdg-open", url)
-	}
-	cmd.Start()
+func (ma *meshApp) connect() {
+	ma.btn.SetText("Connecting...")
+	ma.btn.Disable()
+	ma.statusLabel.SetText("Connecting...")
+	ma.statusDot.FillColor = theme.Color(theme.ColorNameWarning)
+	ma.statusDot.Refresh()
+
+	go func() {
+		c, err := client.New(ma.cfg)
+		if err != nil {
+			ma.statusLabel.SetText(fmt.Sprintf("Error: %v", err))
+			ma.statusDot.FillColor = theme.Color(theme.ColorNameError)
+			ma.statusDot.Refresh()
+			ma.btn.SetText("Connect")
+			ma.btn.Enable()
+			return
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+
+		c.OnPeerUpdate = func(peers []protocol.PeerInfo) {
+			ma.mu.Lock()
+			ma.peers = nil
+			count := 0
+			for _, p := range peers {
+				if p.PublicKey == ma.cfg.PublicKey {
+					continue
+				}
+				if p.Online {
+					count++
+				}
+				ma.peers = append(ma.peers, peerDisplay{
+					Name:   p.Name,
+					Online: p.Online,
+				})
+			}
+			ma.mu.Unlock()
+			ma.peerLabel.SetText(fmt.Sprintf("Peers online: %d", count))
+			ma.peerList.Refresh()
+		}
+
+		c.OnConnected = func(peerName string, tunnelIP string) {
+			ma.statusLabel.SetText(fmt.Sprintf("Tunneled to %s", peerName))
+		}
+
+		if err := c.Connect(ctx); err != nil {
+			cancel()
+			ma.statusLabel.SetText("Connection failed")
+			ma.statusDot.FillColor = theme.Color(theme.ColorNameError)
+			ma.statusDot.Refresh()
+			ma.btn.SetText("Connect")
+			ma.btn.Enable()
+			return
+		}
+
+		ma.mu.Lock()
+		ma.connected = true
+		ma.meshClient = c
+		ma.cancel = cancel
+		ma.mu.Unlock()
+
+		ma.statusLabel.SetText("Connected")
+		ma.statusDot.FillColor = theme.Color(theme.ColorNameSuccess)
+		ma.statusDot.Refresh()
+		ma.btn.SetText("Disconnect")
+		ma.btn.Importance = widget.DangerImportance
+		ma.btn.Enable()
+
+		// Keep alive indicator — blink dot to show it's active
+		go func() {
+			for {
+				ma.mu.RLock()
+				if !ma.connected {
+					ma.mu.RUnlock()
+					return
+				}
+				ma.mu.RUnlock()
+				time.Sleep(2 * time.Second)
+			}
+		}()
+	}()
 }
 
-func waitForEnter() {
-	fmt.Println("\nPress Enter to exit...")
-	buf := make([]byte, 1)
-	os.Stdin.Read(buf)
+func (ma *meshApp) disconnect() {
+	ma.mu.Lock()
+	if ma.cancel != nil {
+		ma.cancel()
+	}
+	if ma.meshClient != nil {
+		ma.meshClient.Disconnect()
+	}
+	ma.connected = false
+	ma.meshClient = nil
+	ma.cancel = nil
+	ma.peers = nil
+	ma.mu.Unlock()
+
+	ma.statusLabel.SetText("Disconnected")
+	ma.statusDot.FillColor = theme.Color(theme.ColorNameError)
+	ma.statusDot.Refresh()
+	ma.peerLabel.SetText("Peers online: —")
+	ma.peerList.Refresh()
+	ma.btn.SetText("Connect")
+	ma.btn.Importance = widget.HighImportance
+	ma.btn.Enable()
 }
