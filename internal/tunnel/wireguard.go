@@ -6,6 +6,7 @@ package tunnel
 import (
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -34,7 +35,9 @@ type Config struct {
 }
 
 // wgConfTmpl is the WireGuard config file format.
-var wgConfTmpl = template.Must(template.New("wg").Parse(`[Interface]
+var wgConfTmpl = template.Must(template.New("wg").Funcs(template.FuncMap{
+	"joinIPs": func(ips []string) string { return strings.Join(ips, ", ") },
+}).Parse(`[Interface]
 PrivateKey = {{.PrivateKey}}
 ListenPort = {{.ListenPort}}
 {{range .Peers}}
@@ -51,12 +54,6 @@ AllowedIPs = {{joinIPs .AllowedIPs}}
 PersistentKeepalive = {{.KeepAlive}}
 {{- end}}
 {{end}}`))
-
-func init() {
-	wgConfTmpl.Funcs(template.FuncMap{
-		"joinIPs": func(ips []string) string { return strings.Join(ips, ", ") },
-	})
-}
 
 // GenerateConfig produces a WireGuard configuration string.
 func (c *Config) GenerateConfig() (string, error) {
@@ -248,5 +245,5 @@ func upLinux(cfg *Config) error {
 }
 
 func writeFile(path, content string) error {
-	return exec.Command("bash", "-c", fmt.Sprintf("cat > %s << 'WGEOF'\n%s\nWGEOF", path, content)).Run()
+	return os.WriteFile(path, []byte(content), 0600)
 }

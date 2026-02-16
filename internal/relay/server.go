@@ -22,6 +22,7 @@ type Server struct {
 	peers map[string]*connectedPeer // keyed by public key
 
 	authToken string // simple shared-secret auth
+	udpRelay  *UDPRelay
 }
 
 type connectedPeer struct {
@@ -36,6 +37,7 @@ func NewServer(authToken string) *Server {
 	return &Server{
 		peers:     make(map[string]*connectedPeer),
 		authToken: authToken,
+		udpRelay:  NewUDPRelay(),
 	}
 }
 
@@ -125,6 +127,7 @@ func (s *Server) handleConn(ctx context.Context, conn *websocket.Conn) {
 			s.coordinatePunch(ctx, env.From, payload.TargetKey)
 
 		case protocol.MsgConnect:
+			s.udpRelay.AddTunnelPair(env.From, env.To)
 			s.forwardTo(ctx, env)
 
 		case protocol.MsgConnectAck:
@@ -275,6 +278,11 @@ func (s *Server) cleanStalePeers(timeout time.Duration) {
 	if len(stale) > 0 {
 		s.broadcastPeerList()
 	}
+}
+
+// StartUDPRelay starts the UDP relay for forwarding WireGuard packets.
+func (s *Server) StartUDPRelay(port int) error {
+	return s.udpRelay.ListenAndServe(port)
 }
 
 // PeerCount returns the number of connected peers.
