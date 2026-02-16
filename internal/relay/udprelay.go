@@ -21,6 +21,7 @@ type UDPRelay struct {
 	mu          sync.RWMutex
 	addrToKey   map[string]string      // UDP addr string -> public key
 	keyToAddr   map[string]*net.UDPAddr // public key -> last-seen UDP addr
+	ipToKey     map[string]string      // IP (no port) -> public key (for NAT remap)
 	tunnelPairs map[string]string      // peer key -> partner key (bidirectional)
 	conn        *net.UDPConn
 }
@@ -30,6 +31,7 @@ func NewUDPRelay() *UDPRelay {
 	return &UDPRelay{
 		addrToKey:   make(map[string]string),
 		keyToAddr:   make(map[string]*net.UDPAddr),
+		ipToKey:     make(map[string]string),
 		tunnelPairs: make(map[string]string),
 	}
 }
@@ -94,6 +96,7 @@ func (u *UDPRelay) ListenAndServe(port int) error {
 			}
 			u.addrToKey[mappedAddr.String()] = key
 			u.keyToAddr[key] = mappedAddr
+			u.ipToKey[raddr.IP.String()] = key
 			u.mu.Unlock()
 
 			shortKey := key
@@ -105,13 +108,33 @@ func (u *UDPRelay) ListenAndServe(port int) error {
 			continue
 		}
 
-		// Forward WireGuard packet to tunnel partner
+		// Forward WireGuard packet to tunnel partner.
+		// First try exact addr match, then fall back to IP-only match
+		// to handle NAT port remapping (e.g. VPN NAT).
 		u.mu.RLock()
 		senderKey, ok := u.addrToKey[raddr.String()]
+		u.mu.RUnlock()
+
 		if !ok {
-			u.mu.RUnlock()
-			continue
+			// NAT may have changed the source port. Look up by IP and
+			// update the mapping so future packets match immediately.
+			u.mu.Lock()
+			senderKey, ok = u.ipToKey[raddr.IP.String()]
+			if ok {
+				if oldAddr, exists := u.keyToAddr[senderKey]; exists {
+					delete(u.addrToKey, oldAddr.String())
+				}
+				u.addrToKey[raddr.String()] = senderKey
+				u.keyToAddr[senderKey] = raddr
+				log.Printf("UDP relay: remapped %s to %s (NAT port change)", senderKey[:min(16, len(senderKey))], raddr)
+			}
+			u.mu.Unlock()
+			if !ok {
+				continue
+			}
 		}
+
+		u.mu.RLock()
 		partnerKey, ok := u.tunnelPairs[senderKey]
 		if !ok {
 			u.mu.RUnlock()
