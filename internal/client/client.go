@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -55,8 +57,18 @@ func (c *Client) Connect(ctx context.Context) error {
 	c.ctx = ctx
 
 	url := fmt.Sprintf("wss://%s:%d/ws", c.cfg.RelayAddr, c.cfg.RelayPort)
+
+	// Set auth token from config or environment
+	authToken := c.cfg.AuthToken
+	if authToken == "" {
+		authToken = os.Getenv("MESHNET_AUTH_TOKEN")
+	}
+	headers := make(http.Header)
+	if authToken != "" {
+		headers.Set("Authorization", "Bearer "+authToken)
+	}
 	opts := &websocket.DialOptions{
-		HTTPHeader: make(map[string][]string),
+		HTTPHeader: headers,
 	}
 
 	conn, _, err := websocket.Dial(ctx, url, opts)

@@ -15,8 +15,9 @@ type Config struct {
 	PrivateKey string `json:"private_key"`
 	PublicKey  string `json:"public_key"`
 
-	RelayAddr string `json:"relay_addr"`
-	RelayPort int    `json:"relay_port"`
+	RelayAddr  string `json:"relay_addr"`
+	RelayPort  int    `json:"relay_port"`
+	AuthToken  string `json:"auth_token,omitempty"`
 
 	TunnelIPv4 string `json:"tunnel_ipv4,omitempty"`
 	ListenPort int    `json:"listen_port"`
