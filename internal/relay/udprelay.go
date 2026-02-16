@@ -5,6 +5,8 @@ package relay
 import (
 	"log"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -69,22 +71,36 @@ func (u *UDPRelay) ListenAndServe(port int) error {
 
 		data := buf[:n]
 
-		// Check for registration packet: "MREG" + base64 public key
+		// Check for registration packet: "MREG" + pubkey + "|" + wg_port
+		// The client sends from an ephemeral port and includes the WireGuard
+		// listen port so we can build the correct address mapping.
 		if n > len(udpRegisterMagic) && string(data[:len(udpRegisterMagic)]) == udpRegisterMagic {
-			key := string(data[len(udpRegisterMagic):])
+			payload := string(data[len(udpRegisterMagic):])
+
+			// Parse key and WireGuard port from "pubkey|port" format.
+			// Fall back to sender address if no port is specified.
+			key := payload
+			mappedAddr := raddr
+			if idx := strings.LastIndex(payload, "|"); idx > 0 {
+				key = payload[:idx]
+				if wgPort, err := strconv.Atoi(payload[idx+1:]); err == nil {
+					mappedAddr = &net.UDPAddr{IP: raddr.IP, Port: wgPort, Zone: raddr.Zone}
+				}
+			}
+
 			u.mu.Lock()
 			if oldAddr, ok := u.keyToAddr[key]; ok {
 				delete(u.addrToKey, oldAddr.String())
 			}
-			u.addrToKey[raddr.String()] = key
-			u.keyToAddr[key] = raddr
+			u.addrToKey[mappedAddr.String()] = key
+			u.keyToAddr[key] = mappedAddr
 			u.mu.Unlock()
 
 			shortKey := key
 			if len(shortKey) > 16 {
 				shortKey = shortKey[:16] + "..."
 			}
-			log.Printf("UDP relay: registered %s from %s", shortKey, raddr)
+			log.Printf("UDP relay: registered %s from %s (mapped to %s)", shortKey, raddr, mappedAddr)
 			conn.WriteToUDP([]byte(udpAckMagic), raddr)
 			continue
 		}

@@ -226,7 +226,8 @@ func (c *Client) relayEndpoint() string {
 
 // registerUDP sends a registration packet to the relay's UDP port so the relay
 // can map our UDP source address to our public key for packet forwarding.
-// This must be called BEFORE tunnel.Up since WireGuard will bind the listen port.
+// Uses an ephemeral port and includes the WireGuard listen port in the message
+// so registration works even when WireGuard already holds the listen port.
 func (c *Client) registerUDP() error {
 	port := c.cfg.RelayUDPPort
 	if port == 0 {
@@ -238,13 +239,15 @@ func (c *Client) registerUDP() error {
 		return err
 	}
 
-	laddr := &net.UDPAddr{Port: c.cfg.ListenPort}
-	conn, err := net.ListenUDP("udp", laddr)
+	// Use ephemeral port so registration works even if WireGuard already
+	// holds the listen port. The WireGuard port is sent in the message so
+	// the relay can build the correct address mapping.
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: 0})
 	if err != nil {
-		return fmt.Errorf("bind UDP port %d: %w", c.cfg.ListenPort, err)
+		return fmt.Errorf("bind ephemeral UDP port: %w", err)
 	}
 
-	msg := append([]byte("MREG"), []byte(c.pubKey.String())...)
+	msg := append([]byte("MREG"), []byte(fmt.Sprintf("%s|%d", c.pubKey.String(), c.cfg.ListenPort))...)
 	if _, err := conn.WriteToUDP(msg, raddr); err != nil {
 		conn.Close()
 		return err
