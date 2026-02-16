@@ -21,6 +21,7 @@ func main() {
 		cert     = flag.String("cert", "", "TLS certificate file (optional, uses HTTP if empty)")
 		key      = flag.String("key", "", "TLS private key file (optional)")
 		token    = flag.String("token", "", "shared auth token (clients must present this to connect)")
+		udpPort  = flag.Int("udp-port", 51820, "UDP relay port for WireGuard packet forwarding")
 	)
 	flag.Parse()
 
@@ -34,6 +35,13 @@ func main() {
 	}
 
 	srv := relay.NewServer(*token)
+
+	// Start UDP relay for WireGuard packet forwarding
+	go func() {
+		if err := srv.StartUDPRelay(*udpPort); err != nil {
+			log.Fatalf("UDP relay: %v", err)
+		}
+	}()
 
 	// Start stale peer cleanup
 	ctx, cancel := context.WithCancel(context.Background())

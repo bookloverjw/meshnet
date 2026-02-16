@@ -6,6 +6,7 @@ package tunnel
 import (
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -244,5 +245,5 @@ func upLinux(cfg *Config) error {
 }
 
 func writeFile(path, content string) error {
-	return exec.Command("bash", "-c", fmt.Sprintf("cat > %s << 'WGEOF'\n%s\nWGEOF", path, content)).Run()
+	return os.WriteFile(path, []byte(content), 0600)
 }

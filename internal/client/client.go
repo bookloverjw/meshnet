@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	"net"
+
 	"github.com/bookloverjw/meshnet/internal/config"
 	"github.com/bookloverjw/meshnet/internal/crypto"
 	"github.com/bookloverjw/meshnet/internal/nat"
@@ -213,6 +215,56 @@ func (c *Client) handlePunchReply(data json.RawMessage) {
 	}()
 }
 
+// relayEndpoint returns the relay server's UDP address for WireGuard forwarding.
+func (c *Client) relayEndpoint() string {
+	port := c.cfg.RelayUDPPort
+	if port == 0 {
+		port = 51820
+	}
+	return fmt.Sprintf("%s:%d", c.cfg.RelayAddr, port)
+}
+
+// registerUDP sends a registration packet to the relay's UDP port so the relay
+// can map our UDP source address to our public key for packet forwarding.
+// This must be called BEFORE tunnel.Up since WireGuard will bind the listen port.
+func (c *Client) registerUDP() error {
+	port := c.cfg.RelayUDPPort
+	if port == 0 {
+		port = 51820
+	}
+
+	raddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", c.cfg.RelayAddr, port))
+	if err != nil {
+		return err
+	}
+
+	laddr := &net.UDPAddr{Port: c.cfg.ListenPort}
+	conn, err := net.ListenUDP("udp", laddr)
+	if err != nil {
+		return fmt.Errorf("bind UDP port %d: %w", c.cfg.ListenPort, err)
+	}
+
+	msg := append([]byte("MREG"), []byte(c.pubKey.String())...)
+	if _, err := conn.WriteToUDP(msg, raddr); err != nil {
+		conn.Close()
+		return err
+	}
+
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 64)
+	n, _, err := conn.ReadFromUDP(buf)
+	conn.Close()
+	if err != nil {
+		return fmt.Errorf("UDP registration timeout: %w", err)
+	}
+	if string(buf[:n]) != "MACK" {
+		return fmt.Errorf("unexpected UDP ack: %s", string(buf[:n]))
+	}
+
+	log.Printf("registered with UDP relay at %s:%d", c.cfg.RelayAddr, port)
+	return nil
+}
+
 // ConnectToPeer initiates a WireGuard tunnel to the specified peer.
 func (c *Client) ConnectToPeer(peerKey string) error {
 	c.mu.RLock()
@@ -223,15 +275,7 @@ func (c *Client) ConnectToPeer(peerKey string) error {
 		return fmt.Errorf("peer not found: %s", peerKey[:16]+"...")
 	}
 
-	// Request hole punch via relay
-	c.send(protocol.MsgPunchReq, "", protocol.PunchRequestPayload{
-		TargetKey: peerKey,
-	})
-
-	// Small delay to let hole punch attempt proceed
-	time.Sleep(2 * time.Second)
-
-	// Send connect request
+	// Send connect request (uses relay for WireGuard forwarding)
 	payload := protocol.ConnectPayload{
 		TargetKey:   peerKey,
 		WGPublicKey: c.pubKey.String(),
@@ -269,6 +313,13 @@ func (c *Client) handleConnect(env protocol.Envelope) {
 		return
 	}
 
+	// Register with UDP relay before WireGuard binds the port
+	if err := c.registerUDP(); err != nil {
+		log.Printf("UDP relay registration failed: %v", err)
+	}
+
+	endpoint := c.relayEndpoint()
+
 	wgCfg := &tunnel.Config{
 		PrivateKey: c.privKey,
 		ListenPort: c.cfg.ListenPort,
@@ -277,6 +328,7 @@ func (c *Client) handleConnect(env protocol.Envelope) {
 		Peers: []tunnel.PeerConfig{
 			{
 				PublicKey:  peerPubKey,
+				Endpoint:   endpoint,
 				AllowedIPs: []string{payload.TunnelIPv4 + "/32"},
 				KeepAlive:  25,
 			},
@@ -316,6 +368,13 @@ func (c *Client) handleConnectAck(env protocol.Envelope) {
 		return
 	}
 
+	// Register with UDP relay before WireGuard binds the port
+	if err := c.registerUDP(); err != nil {
+		log.Printf("UDP relay registration failed: %v", err)
+	}
+
+	endpoint := c.relayEndpoint()
+
 	wgCfg := &tunnel.Config{
 		PrivateKey: c.privKey,
 		ListenPort: c.cfg.ListenPort,
@@ -324,6 +383,7 @@ func (c *Client) handleConnectAck(env protocol.Envelope) {
 		Peers: []tunnel.PeerConfig{
 			{
 				PublicKey:  peerPubKey,
+				Endpoint:   endpoint,
 				AllowedIPs: []string{payload.TunnelIPv4 + "/32"},
 				KeepAlive:  25,
 			},
