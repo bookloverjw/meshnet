@@ -63,6 +63,7 @@ func (u *UDPRelay) ListenAndServe(port int) error {
 	u.conn = conn
 	log.Printf("UDP relay listening on :%d", port)
 
+	pktCount := 0
 	buf := make([]byte, 65535)
 	for {
 		n, raddr, err := conn.ReadFromUDP(buf)
@@ -72,6 +73,10 @@ func (u *UDPRelay) ListenAndServe(port int) error {
 		}
 
 		data := buf[:n]
+		pktCount++
+		if pktCount <= 20 {
+			log.Printf("UDP relay: pkt #%d from %s (%d bytes)", pktCount, raddr, n)
+		}
 
 		// Check for registration packet: "MREG" + pubkey + "|" + wg_port
 		// The client sends from an ephemeral port and includes the WireGuard
@@ -130,6 +135,7 @@ func (u *UDPRelay) ListenAndServe(port int) error {
 			}
 			u.mu.Unlock()
 			if !ok {
+				log.Printf("UDP relay: DROP pkt from %s (unknown sender)", raddr)
 				continue
 			}
 		}
@@ -138,14 +144,19 @@ func (u *UDPRelay) ListenAndServe(port int) error {
 		partnerKey, ok := u.tunnelPairs[senderKey]
 		if !ok {
 			u.mu.RUnlock()
+			log.Printf("UDP relay: DROP pkt from %s (no tunnel pair for sender)", raddr)
 			continue
 		}
 		partnerAddr, ok := u.keyToAddr[partnerKey]
 		u.mu.RUnlock()
 		if !ok {
+			log.Printf("UDP relay: DROP pkt from %s (partner addr unknown)", raddr)
 			continue
 		}
 
+		if pktCount <= 20 {
+			log.Printf("UDP relay: FWD %d bytes %s -> %s", n, raddr, partnerAddr)
+		}
 		conn.WriteToUDP(data, partnerAddr)
 	}
 }
