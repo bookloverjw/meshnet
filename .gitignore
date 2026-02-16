@@ -1,4 +1,6 @@
 bin/
+mesh
+meshd
 *.exe
 *.conf
 config.json
