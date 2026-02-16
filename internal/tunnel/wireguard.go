@@ -128,6 +128,11 @@ func Down() error {
 func upDarwin(cfg *Config) error {
 	iface := InterfaceName()
 
+	// Tear down any stale interface from a previous run
+	exec.Command("sudo", "ifconfig", iface, "down").Run()
+	// Give wireguard-go a moment to exit if the interface was removed
+	exec.Command("pkill", "-f", "wireguard-go "+iface).Run()
+
 	confStr, err := cfg.GenerateConfig()
 	if err != nil {
 		return err
